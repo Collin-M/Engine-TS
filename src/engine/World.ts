@@ -51,7 +51,7 @@ import { EntityQueueState, PlayerQueueType } from '#/engine/entity/PlayerQueueRe
 import { PlayerStat } from '#/engine/entity/PlayerStat.js';
 import { SessionLog } from '#/engine/entity/tracking/SessionLog.js';
 import { WealthTransactionEvent, WealthEvent } from '#/engine/entity/tracking/WealthEvent.js';
-import GameMap, { changeLocCollision, changeNpcCollision, changePlayerCollision } from '#/engine/GameMap.js';
+import GameMap, { changeLocCollision, changeNpcCollision, changeBlockCollision, changePlayerOccCollision } from '#/engine/GameMap.js';
 import { Inventory } from '#/engine/Inventory.js';
 import ScriptPointer from '#/engine/script/ScriptPointer.js';
 import ScriptProvider from '#/engine/script/ScriptProvider.js';
@@ -669,7 +669,7 @@ class World {
                 npc.turn();
             } catch (err) {
                 console.error(err);
-                this.removeNpc(npc, -1);
+                this.removeNpc(npc, 0);
             }
         }
         this.cycleStats[WorldStat.NPC] = Date.now() - start;
@@ -707,11 +707,16 @@ class World {
                 }
                 // - engine queue
                 player.processEngineQueue();
-                // Update target facing
+                // Face the interaction target -- both halves, the same tick the op set the target (the op ran
+                // in processClientsIn) and before processInteraction can clear it: the FACE_ENTITY mask, plus
+                // the serverside faceAngle toward a pathing target (for new observers).
                 player.setFaceEntity();
+                player.reorientEntity();
                 // - interactions
                 // - movement
                 player.processInteraction();
+                // After movement: face a loc/obj target if we walked over and held still (needs stepsTaken).
+                player.reorient();
 
                 // - run energy
                 player.updateEnergy();
@@ -904,15 +909,24 @@ class World {
 
                 const remote = player.client.remoteAddress;
                 if (remote.indexOf('.') !== -1) {
-                    // IPv4 - last octet determines the bucket
+                    // IPv4
                     const octets = remote.split('.');
-                    const bucket = (parseInt(octets[0]) << 24) | (parseInt(octets[1]) << 16) | (parseInt(octets[2]) << 8) | parseInt(octets[3]);
+                    const bucket = ((parseInt(octets[0]) << 24) | (parseInt(octets[1]) << 16) | (parseInt(octets[2]) << 8) | parseInt(octets[3])) >>> 0;
                     this.playerLoop.add(BigInt(bucket), player);
                 } else if (remote.indexOf(':') !== -1) {
-                    // IPv6 - site prefix determines the bucket
-                    const hextets = remote.split(':');
-                    const bucket = parseInt(hextets[2], 16) % 256;
-                    this.playerLoop.add(BigInt(bucket), player);
+                    // IPv6
+                    const hextets = remote.split('%', 1)[0].split(':');
+                    let omitted = 8 - hextets.filter(Boolean).length;
+                    let key = 0n;
+                    for (const hextet of hextets) {
+                        if (hextet) {
+                            key = (key << 16n) | BigInt(parseInt(hextet, 16));
+                        } else if (omitted) {
+                            key <<= BigInt(omitted * 16);
+                            omitted = 0;
+                        }
+                    }
+                    this.playerLoop.add(key, player);
                 }
             } else {
                 // 127.0.0.1
@@ -984,7 +998,7 @@ class World {
 
         // TODO: benchmark this?
         for (const player of this.playerLoop.all()) {
-            player.reorient();
+            // facing (reorientEntity/reorient) runs in the player's turn (processPlayers), not here.
             player.buildArea.rebuildNormal(); // set origin before compute player is why this is above.
 
             const appearance = player.masks & PlayerInfoProt.APPEARANCE ? player.generateAppearance() : (player.appearanceBuf ?? player.generateAppearance());
@@ -1037,7 +1051,7 @@ class World {
         }
 
         for (const npc of this.npcs) {
-            npc.reorient();
+            // facing (reorientEntity/reorient) runs in Npc.turn(), not here.
             rsbuf.computeNpc(
                 npc.x,
                 npc.level,
@@ -1271,7 +1285,7 @@ class World {
                 break;
             case BlockWalk.ALL:
                 changeNpcCollision(npc.width, npc.x, npc.z, npc.level, true);
-                changePlayerCollision(npc.width, npc.x, npc.z, npc.level, true);
+                changeBlockCollision(npc.width, npc.x, npc.z, npc.level, true);
                 break;
         }
 
@@ -1291,6 +1305,10 @@ class World {
     }
 
     removeNpc(npc: Npc, duration: number): void {
+        if (!npc.isActive) {
+            return;
+        }
+
         const zone = this.gameMap.getZone(npc.x, npc.z, npc.level);
         const adjustedDuration = this.scaleByPlayerCount(duration);
         zone.leave(npc);
@@ -1302,7 +1320,7 @@ class World {
                 break;
             case BlockWalk.ALL:
                 changeNpcCollision(npc.width, npc.x, npc.z, npc.level, false);
-                changePlayerCollision(npc.width, npc.x, npc.z, npc.level, false);
+                changeBlockCollision(npc.width, npc.x, npc.z, npc.level, false);
                 break;
         }
 
@@ -1596,6 +1614,7 @@ class World {
         delete this.players[player.slot];
         player.unlink();
         changeNpcCollision(player.width, player.x, player.z, player.level, false);
+        changePlayerOccCollision(player.width, player.x, player.z, player.level, false);
         player.cleanup();
 
         player.isActive = false;
